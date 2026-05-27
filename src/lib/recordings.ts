@@ -7,30 +7,20 @@ import type {
   TranscriptWord,
 } from "@/lib/types";
 
-export const RECORDING_SELECT = `
-  id,
-  user_id,
-  title,
-  file_name,
-  file_path,
-  mime_type,
-  duration_seconds,
-  waveform_peaks,
-  transcript_text,
-  transcript_words,
-  transcript_segments,
-  notes_markdown,
-  notes_json,
-  annotations,
-  status,
-  error_message,
-  created_at,
-  updated_at
-`;
-
 export function normalizeRecording(row: RecordingRow): Recording {
   return {
-    ...row,
+    created_at: timestampString(row.created_at),
+    duration_seconds: row.duration_seconds,
+    error_message: row.error_message,
+    file_name: row.file_name,
+    id: row.id,
+    mime_type: row.mime_type,
+    notes_markdown: row.notes_markdown,
+    status: row.status,
+    title: row.title,
+    transcript_text: row.transcript_text,
+    updated_at: timestampString(row.updated_at),
+    user_id: row.user_id,
     annotations: arrayOf<LessonAnnotation>(row.annotations),
     notes_json: lessonNotesOrNull(row.notes_json),
     transcript_segments: arrayOf<TranscriptSegment>(row.transcript_segments),
@@ -96,6 +86,14 @@ function lessonNotesOrNull(value: unknown): LessonNotes | null {
   }
 
   return value as LessonNotes;
+}
+
+function timestampString(value: unknown) {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  return typeof value === "string" ? value : new Date().toISOString();
 }
 
 function slugify(value: string) {

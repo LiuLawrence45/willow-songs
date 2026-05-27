@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import { getRecordingChatContext } from "@/lib/db";
 import { answerTranscriptQuestion } from "@/lib/openai";
 import { createClient } from "@/lib/supabase/server";
 
@@ -26,21 +27,16 @@ export async function POST(
     return NextResponse.json({ error: "Missing question." }, { status: 400 });
   }
 
-  const recording = await supabase
-    .from("recordings")
-    .select("transcript_text, notes_markdown, title")
-    .eq("id", id)
-    .eq("user_id", user.id)
-    .single();
+  const recording = await getRecordingChatContext({ id, userId: user.id });
 
-  if (recording.error || !recording.data) {
+  if (!recording) {
     return NextResponse.json({ error: "Recording not found." }, { status: 404 });
   }
 
   const answer = await answerTranscriptQuestion({
-    notes: recording.data.notes_markdown ?? "",
+    notes: recording.notesMarkdown ?? "",
     question,
-    transcript: recording.data.transcript_text ?? "",
+    transcript: recording.transcriptText ?? "",
   });
 
   return NextResponse.json({ answer });

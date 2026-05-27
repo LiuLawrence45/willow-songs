@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 
-import { normalizeRecording, RECORDING_SELECT } from "@/lib/recordings";
+import { updateRecordingNotes } from "@/lib/db";
 import { createClient } from "@/lib/supabase/server";
-import type { RecordingRow } from "@/lib/types";
 
 export async function PATCH(
   request: Request,
@@ -24,19 +23,19 @@ export async function PATCH(
     return NextResponse.json({ error: "Missing notes." }, { status: 400 });
   }
 
-  const update = await supabase
-    .from("recordings")
-    .update({ notes_markdown: body.notes_markdown })
-    .eq("id", id)
-    .eq("user_id", user.id)
-    .select(RECORDING_SELECT)
-    .single();
-
-  if (update.error) {
-    return NextResponse.json({ error: update.error.message }, { status: 500 });
+  try {
+    const recording = await updateRecordingNotes({
+      id,
+      notesMarkdown: body.notes_markdown,
+      userId: user.id,
+    });
+    return NextResponse.json({ recording });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : "Unable to save notes.",
+      },
+      { status: 500 },
+    );
   }
-
-  return NextResponse.json({
-    recording: normalizeRecording(update.data as RecordingRow),
-  });
 }

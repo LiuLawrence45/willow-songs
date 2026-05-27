@@ -55,7 +55,6 @@ export type Recording = {
   user_id: string;
   title: string;
   file_name: string | null;
-  file_path: string;
   mime_type: string | null;
   duration_seconds: number | null;
   waveform_peaks: number[];
@@ -79,6 +78,8 @@ export type RecordingRow = Omit<
   | "notes_json"
   | "annotations"
 > & {
+  blob_pathname: string;
+  blob_url: string;
   waveform_peaks: unknown;
   transcript_words: unknown;
   transcript_segments: unknown;

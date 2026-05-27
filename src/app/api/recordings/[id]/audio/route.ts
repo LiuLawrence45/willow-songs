@@ -1,5 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 
+import { getRecordingAudio } from "@/lib/db";
+import { getRequiredEnv } from "@/lib/env";
 import { createClient } from "@/lib/supabase/server";
 
 export async function GET(
@@ -16,27 +18,51 @@ export async function GET(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const recording = await supabase
-    .from("recordings")
-    .select("file_path")
-    .eq("id", id)
-    .eq("user_id", user.id)
-    .single();
+  const recording = await getRecordingAudio({ id, userId: user.id });
 
-  if (recording.error || !recording.data?.file_path) {
+  if (!recording) {
     return NextResponse.json({ error: "Recording not found." }, { status: 404 });
   }
 
-  const signed = await supabase.storage
-    .from("recordings")
-    .createSignedUrl(recording.data.file_path, 60 * 60);
+  const headers = new Headers({
+    Authorization: `Bearer ${getRequiredEnv("BLOB_READ_WRITE_TOKEN")}`,
+  });
+  const range = request.headers.get("range");
 
-  if (signed.error || !signed.data?.signedUrl) {
-    return NextResponse.json(
-      { error: signed.error?.message ?? "Unable to load audio." },
-      { status: 500 },
-    );
+  if (range) {
+    headers.set("Range", range);
   }
 
-  return NextResponse.redirect(new URL(signed.data.signedUrl, request.url));
+  const blobResponse = await fetch(recording.blobUrl, { headers });
+
+  if (!blobResponse.ok && blobResponse.status !== 206) {
+    return NextResponse.json({ error: "Unable to load audio." }, { status: 500 });
+  }
+
+  const responseHeaders = new Headers({
+    "Cache-Control": "private, no-cache",
+    "Content-Type":
+      blobResponse.headers.get("content-type") ||
+      recording.mimeType ||
+      "application/octet-stream",
+    "X-Content-Type-Options": "nosniff",
+  });
+
+  for (const header of [
+    "accept-ranges",
+    "content-length",
+    "content-range",
+    "etag",
+    "last-modified",
+  ]) {
+    const value = blobResponse.headers.get(header);
+    if (value) {
+      responseHeaders.set(header, value);
+    }
+  }
+
+  return new NextResponse(blobResponse.body, {
+    headers: responseHeaders,
+    status: blobResponse.status,
+  });
 }
