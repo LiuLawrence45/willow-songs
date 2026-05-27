@@ -34,6 +34,21 @@ type ChatMessage = {
   content: string;
 };
 
+type UploadStage = "preparing" | "uploading" | "processing" | "complete" | "error";
+
+type UploadState = {
+  etaSeconds: number | null;
+  fileName: string;
+  fileSize: number;
+  loaded: number;
+  message: string;
+  percentage: number;
+  speedBps: number | null;
+  stage: UploadStage;
+  startedAt: number;
+  total: number;
+};
+
 export function SongsApp({
   initialRecordings,
   userEmail,
@@ -48,6 +63,8 @@ export function SongsApp({
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadState, setUploadState] = useState<UploadState | null>(null);
+  const [draggingFile, setDraggingFile] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatQuestion, setChatQuestion] = useState("");
@@ -60,6 +77,7 @@ export function SongsApp({
     useState<LessonAnnotation | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const dragDepthRef = useRef(0);
 
   const activeRecording = useMemo(
     () => recordings.find((recording) => recording.id === activeId) ?? recordings[0] ?? null,
@@ -85,31 +103,97 @@ export function SongsApp({
       return;
     }
 
+    if (uploading) {
+      setUploadError("An upload is already running. Let this one finish first.");
+      return;
+    }
+
+    if (!isSupportedMediaFile(file)) {
+      setUploadError("Choose an audio recording, MP4, QuickTime, or M4V file.");
+      return;
+    }
+
+    const recordingId = crypto.randomUUID();
+    const startedAt = Date.now();
+    const fileName = file.name || "recording";
+
     setUploadError(null);
     setUploading(true);
+    setUploadState({
+      etaSeconds: null,
+      fileName,
+      fileSize: file.size,
+      loaded: 0,
+      message: "Preparing secure upload",
+      percentage: 0,
+      speedBps: null,
+      stage: "preparing",
+      startedAt,
+      total: file.size,
+    });
 
     try {
-      const analysis = await analyzeAudio(file);
-      const recordingId = crypto.randomUUID();
       const blob = await upload(
-        `${userId}/${recordingId}/${safeFileName(file.name || "recording")}`,
+        `${userId}/${recordingId}/${safeFileName(fileName)}`,
         file,
         {
           access: "private",
           contentType: file.type || "application/octet-stream",
           handleUploadUrl: "/api/recordings/blob",
           multipart: true,
+          onUploadProgress: (event) => {
+            const progress = getUploadProgress(event, file.size, startedAt);
+
+            setUploadState((current) =>
+              current
+                ? {
+                    ...current,
+                    ...progress,
+                    message: "Uploading to Willow Songs",
+                    stage: "uploading",
+                  }
+                : current,
+            );
+          },
         },
       );
+      setUploadState((current) =>
+        current
+          ? {
+              ...current,
+              etaSeconds: null,
+              loaded: current.total,
+              message: "Upload complete. Transcribing and writing notes.",
+              percentage: 100,
+              stage: "processing",
+            }
+          : current,
+      );
+
+      const analysis = await analyzeAudio(file);
+      const optimisticRecording = createOptimisticRecording({
+        analysis,
+        file,
+        recordingId,
+        title: stripExtension(fileName),
+        userId,
+      });
+
+      setRecordings((current) => [
+        optimisticRecording,
+        ...current.filter((recording) => recording.id !== optimisticRecording.id),
+      ]);
+      setActiveId(optimisticRecording.id);
+      setMobileDetailOpen(true);
 
       const response = await fetch("/api/recordings", {
         body: JSON.stringify({
           blob_pathname: blob.pathname,
           duration_seconds: analysis.durationSeconds,
-          file_name: file.name || null,
+          file_name: fileName || null,
           mime_type: file.type || null,
           recording_id: recordingId,
-          title: stripExtension(file.name),
+          title: stripExtension(fileName),
           waveform_peaks: analysis.peaks,
         }),
         headers: { "Content-Type": "application/json" },
@@ -132,14 +216,93 @@ export function SongsApp({
       if (!response.ok) {
         throw new Error(payload.error ?? "Upload failed.");
       }
+
+      if (!payload.recording) {
+        throw new Error("Upload finished, but the recording was not returned.");
+      }
+
+      setUploadState((current) =>
+        current
+          ? {
+              ...current,
+              etaSeconds: null,
+              message: "Notes are ready.",
+              percentage: 100,
+              stage: "complete",
+            }
+          : current,
+      );
+      window.setTimeout(() => {
+        setUploadState((current) =>
+          current?.stage === "complete" ? null : current,
+        );
+      }, 2400);
     } catch (error) {
-      setUploadError(error instanceof Error ? error.message : "Upload failed.");
+      const message = error instanceof Error ? error.message : "Upload failed.";
+      setUploadError(message);
+      setUploadState((current) =>
+        current
+          ? {
+              ...current,
+              etaSeconds: null,
+              message,
+              stage: "error",
+            }
+          : current,
+      );
     } finally {
       setUploading(false);
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
     }
+  }
+
+  function handleDragEnter(event: React.DragEvent<HTMLElement>) {
+    if (!hasFileDrag(event)) {
+      return;
+    }
+
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setDraggingFile(true);
+  }
+
+  function handleDragOver(event: React.DragEvent<HTMLElement>) {
+    if (!hasFileDrag(event)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.dataTransfer.dropEffect = uploading ? "none" : "copy";
+  }
+
+  function handleDragLeave(event: React.DragEvent<HTMLElement>) {
+    if (!hasFileDrag(event)) {
+      return;
+    }
+
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+
+    if (dragDepthRef.current === 0) {
+      setDraggingFile(false);
+    }
+  }
+
+  function handleDrop(event: React.DragEvent<HTMLElement>) {
+    if (!hasFileDrag(event)) {
+      return;
+    }
+
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setDraggingFile(false);
+
+    const droppedFile =
+      Array.from(event.dataTransfer.files).find(isSupportedMediaFile) ??
+      event.dataTransfer.files[0];
+
+    void handleUpload(droppedFile);
   }
 
   async function saveNotes() {
@@ -253,7 +416,14 @@ export function SongsApp({
   }
 
   return (
-    <main className="min-h-screen bg-[#0c0c0b] text-white">
+    <main
+      className="relative min-h-screen bg-[#0c0c0b] text-white"
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+    >
+      {draggingFile && <DropOverlay uploading={uploading} />}
       <div className="mx-auto flex min-h-screen w-full max-w-[1560px] flex-col px-3 py-3 sm:px-4 lg:px-6">
         <header className="rounded-lg border border-[#1f2228] bg-[#111214]">
           <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-4 lg:px-5">
@@ -278,7 +448,7 @@ export function SongsApp({
                 ref={fileInputRef}
                 className="hidden"
                 type="file"
-                accept="audio/*,video/mp4"
+                accept="audio/*,video/mp4,video/quicktime,video/x-m4v"
                 onChange={(event) => void handleUpload(event.target.files?.[0])}
               />
               <button
@@ -292,7 +462,11 @@ export function SongsApp({
                   <Upload aria-hidden="true" size={17} />
                 )}
                 <span className="hidden sm:inline">
-                  {uploading ? "Processing" : "Upload"}
+                  {uploading && uploadState?.stage === "uploading"
+                    ? `${Math.round(uploadState.percentage)}%`
+                    : uploading
+                      ? "Working"
+                      : "Upload"}
                 </span>
               </button>
               <form action="/auth/sign-out" method="post">
@@ -307,6 +481,8 @@ export function SongsApp({
             </div>
           </div>
         </header>
+
+        {uploadState && <UploadProgressPanel upload={uploadState} />}
 
         {uploadError && (
           <div className="mt-3 flex items-start gap-2 rounded-lg border border-[#2563eb]/60 bg-[#151923] px-4 py-3 text-sm leading-6 text-white">
@@ -477,6 +653,87 @@ function RecordingList({
         </div>
       )}
     </aside>
+  );
+}
+
+function DropOverlay({ uploading }: { uploading: boolean }) {
+  return (
+    <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-[#0c0c0b]/72 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-md rounded-lg border border-dashed border-[#2563eb] bg-[#111214] p-6 text-center shadow-2xl">
+        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-lg border border-[#2563eb]/50 bg-[#151923]">
+          <Upload aria-hidden="true" size={24} />
+        </div>
+        <h2 className="mt-4 text-xl font-medium">
+          {uploading ? "Upload already running" : "Drop recording"}
+        </h2>
+        <p className="mt-2 text-sm leading-6 text-[#a8abb0]">
+          {uploading
+            ? "Let the current file finish before adding another lesson."
+            : "Release to upload this lesson into Willow Songs."}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function UploadProgressPanel({ upload }: { upload: UploadState }) {
+  const percentage =
+    upload.stage === "processing" || upload.stage === "complete"
+      ? 100
+      : Math.max(0, Math.min(100, upload.percentage));
+  const statusLabel = getUploadStageLabel(upload.stage);
+  const progressDetail =
+    upload.stage === "uploading"
+      ? `${formatBytes(upload.loaded)} of ${formatBytes(upload.total || upload.fileSize)}`
+      : upload.message;
+
+  return (
+    <section
+      className="mt-3 rounded-lg border border-[#1f2228] bg-[#111214] px-4 py-4"
+      aria-live="polite"
+    >
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex min-w-0 items-start gap-3">
+          <div
+            className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border ${
+              upload.stage === "error"
+                ? "border-[#2563eb]/60 bg-[#151923]"
+                : "border-white/10 bg-[#0c0c0b]"
+            }`}
+          >
+            {upload.stage === "complete" ? (
+              <CheckCircle2 aria-hidden="true" size={20} className="text-[#2563eb]" />
+            ) : upload.stage === "error" ? (
+              <AlertCircle aria-hidden="true" size={20} />
+            ) : (
+              <Upload aria-hidden="true" size={20} />
+            )}
+          </div>
+          <div className="min-w-0">
+            <p className="truncate font-medium text-white">{upload.fileName}</p>
+            <p className="mt-1 text-sm text-[#7d8187]">
+              {statusLabel} / {progressDetail}
+            </p>
+          </div>
+        </div>
+
+        <div className="min-w-0 lg:w-[420px]">
+          <div className="h-2 overflow-hidden rounded-full bg-[#1f2228]">
+            <div
+              className={`h-full rounded-full bg-[#2563eb] transition-[width] duration-300 ${
+                upload.stage === "processing" ? "animate-pulse" : ""
+              }`}
+              style={{ width: `${percentage}%` }}
+            />
+          </div>
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 font-mono text-xs text-[#7d8187]">
+            <span>{Math.round(percentage)}%</span>
+            <span>{formatUploadRate(upload.speedBps)}</span>
+            <span>{formatEta(upload.etaSeconds)}</span>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -1024,32 +1281,36 @@ async function analyzeAudio(file: File): Promise<{
     return { durationSeconds: null, peaks: fallbackPeaks() };
   }
 
-  try {
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    const audioContext = new AudioContextClass();
-    const arrayBuffer = await file.arrayBuffer();
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
-    const channel = audioBuffer.getChannelData(0);
-    const bucketCount = 120;
-    const bucketSize = Math.max(1, Math.floor(channel.length / bucketCount));
-    const peaks = Array.from({ length: bucketCount }, (_, bucket) => {
-      let sum = 0;
-      const start = bucket * bucketSize;
-      const end = Math.min(channel.length, start + bucketSize);
+  return new Promise((resolve) => {
+    const audio = document.createElement("audio");
+    const objectUrl = URL.createObjectURL(file);
+    let settled = false;
 
-      for (let index = start; index < end; index += 1) {
-        sum += Math.abs(channel[index] ?? 0);
+    const finish = (durationSeconds: number | null) => {
+      if (settled) {
+        return;
       }
 
-      return Math.min(0.96, Math.max(0.12, sum / Math.max(1, end - start) * 4));
-    });
+      settled = true;
+      window.clearTimeout(timeoutId);
+      audio.removeAttribute("src");
+      audio.load();
+      URL.revokeObjectURL(objectUrl);
+      resolve({
+        durationSeconds,
+        peaks: fallbackPeaks(),
+      });
+    };
 
-    await audioContext.close();
+    const timeoutId = window.setTimeout(() => finish(null), 3000);
 
-    return { durationSeconds: audioBuffer.duration, peaks };
-  } catch {
-    return { durationSeconds: null, peaks: fallbackPeaks() };
-  }
+    audio.preload = "metadata";
+    audio.onloadedmetadata = () => {
+      finish(Number.isFinite(audio.duration) ? audio.duration : null);
+    };
+    audio.onerror = () => finish(null);
+    audio.src = objectUrl;
+  });
 }
 
 function stripExtension(fileName: string) {
@@ -1063,6 +1324,137 @@ function safeFileName(fileName: string) {
     .replace(/^-+|-+$/g, "");
 
   return cleaned || "recording";
+}
+
+function createOptimisticRecording({
+  analysis,
+  file,
+  recordingId,
+  title,
+  userId,
+}: {
+  analysis: { durationSeconds: number | null; peaks: number[] };
+  file: File;
+  recordingId: string;
+  title: string;
+  userId: string;
+}): Recording {
+  const now = new Date().toISOString();
+
+  return {
+    annotations: [],
+    created_at: now,
+    duration_seconds: analysis.durationSeconds,
+    error_message: null,
+    file_name: file.name || null,
+    id: recordingId,
+    mime_type: file.type || null,
+    notes_json: null,
+    notes_markdown: null,
+    status: "processing",
+    title: title || "Untitled lesson",
+    transcript_segments: [],
+    transcript_text: null,
+    transcript_words: [],
+    updated_at: now,
+    user_id: userId,
+    waveform_peaks: analysis.peaks,
+  };
+}
+
+function getUploadProgress(
+  event: { loaded?: number; percentage?: number; total?: number },
+  fileSize: number,
+  startedAt: number,
+) {
+  const total = event.total && event.total > 0 ? event.total : fileSize;
+  const loaded =
+    event.loaded ??
+    Math.round(((event.percentage ?? 0) / 100) * Math.max(total, fileSize));
+  const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.25);
+  const speedBps = loaded > 0 ? loaded / elapsedSeconds : null;
+  const etaSeconds =
+    speedBps && total > loaded ? Math.max(0, (total - loaded) / speedBps) : null;
+
+  return {
+    etaSeconds,
+    loaded,
+    percentage:
+      event.percentage ??
+      (total > 0 ? Number(((loaded / total) * 100).toFixed(2)) : 0),
+    speedBps,
+    total,
+  };
+}
+
+function hasFileDrag(event: React.DragEvent<HTMLElement>) {
+  return Array.from(event.dataTransfer.types).includes("Files");
+}
+
+function isSupportedMediaFile(file: File) {
+  const type = file.type.toLowerCase();
+  const name = file.name.toLowerCase();
+
+  return (
+    type.startsWith("audio/") ||
+    ["video/mp4", "video/quicktime", "video/x-m4v"].includes(type) ||
+    /\.(aac|aif|aiff|flac|m4a|m4v|mp3|mp4|ogg|opus|wav|webm)$/.test(name)
+  );
+}
+
+function getUploadStageLabel(stage: UploadStage) {
+  switch (stage) {
+    case "preparing":
+      return "Preparing";
+    case "uploading":
+      return "Uploading";
+    case "processing":
+      return "Transcribing";
+    case "complete":
+      return "Ready";
+    case "error":
+      return "Needs attention";
+  }
+}
+
+function formatUploadRate(speedBps: number | null) {
+  if (!speedBps || !Number.isFinite(speedBps)) {
+    return "calculating";
+  }
+
+  return `${formatBytes(speedBps)}/s`;
+}
+
+function formatEta(seconds: number | null) {
+  if (seconds === null || !Number.isFinite(seconds)) {
+    return "estimating";
+  }
+
+  if (seconds <= 1) {
+    return "finishing";
+  }
+
+  if (seconds < 60) {
+    return `${Math.ceil(seconds)}s left`;
+  }
+
+  return `${Math.ceil(seconds / 60)}m left`;
+}
+
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const exponent = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1,
+  );
+  const value = bytes / 1024 ** exponent;
+  const precision = value >= 10 || exponent === 0 ? 0 : 1;
+
+  return `${value.toFixed(precision)} ${units[exponent]}`;
 }
 
 async function readJsonResponse<T extends { error?: string }>(
