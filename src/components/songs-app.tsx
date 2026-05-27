@@ -49,6 +49,8 @@ type UploadState = {
   total: number;
 };
 
+const MULTIPART_UPLOAD_THRESHOLD_BYTES = 64 * 1024 * 1024;
+
 export function SongsApp({
   initialRecordings,
   userEmail,
@@ -116,6 +118,7 @@ export function SongsApp({
     const recordingId = crypto.randomUUID();
     const startedAt = Date.now();
     const fileName = file.name || "recording";
+    const contentType = getMediaContentType(file);
 
     setUploadError(null);
     setUploading(true);
@@ -132,17 +135,35 @@ export function SongsApp({
       total: file.size,
     });
 
+    let noProgressTimeoutId: number | null = null;
+
     try {
+      noProgressTimeoutId = window.setTimeout(() => {
+        setUploadState((current) =>
+          current && current.stage === "preparing"
+            ? {
+                ...current,
+                message: "Still connecting to Blob. Waiting for the first bytes.",
+              }
+            : current,
+        );
+      }, 15000);
+
       const blob = await upload(
         `${userId}/${recordingId}/${safeFileName(fileName)}`,
         file,
         {
           access: "private",
-          contentType: file.type || "application/octet-stream",
+          contentType,
           handleUploadUrl: "/api/recordings/blob",
-          multipart: true,
+          multipart: file.size >= MULTIPART_UPLOAD_THRESHOLD_BYTES,
           onUploadProgress: (event) => {
             const progress = getUploadProgress(event, file.size, startedAt);
+
+            if (progress.loaded > 0 && noProgressTimeoutId) {
+              window.clearTimeout(noProgressTimeoutId);
+              noProgressTimeoutId = null;
+            }
 
             setUploadState((current) =>
               current
@@ -191,7 +212,7 @@ export function SongsApp({
           blob_pathname: blob.pathname,
           duration_seconds: analysis.durationSeconds,
           file_name: fileName || null,
-          mime_type: file.type || null,
+          mime_type: contentType,
           recording_id: recordingId,
           title: stripExtension(fileName),
           waveform_peaks: analysis.peaks,
@@ -251,6 +272,10 @@ export function SongsApp({
           : current,
       );
     } finally {
+      if (noProgressTimeoutId) {
+        window.clearTimeout(noProgressTimeoutId);
+      }
+
       setUploading(false);
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
@@ -1326,6 +1351,35 @@ function safeFileName(fileName: string) {
   return cleaned || "recording";
 }
 
+function getMediaContentType(file: File) {
+  const type = file.type.trim().toLowerCase();
+
+  if (type && type !== "application/octet-stream") {
+    return type;
+  }
+
+  const extension = file.name.toLowerCase().split(".").pop();
+  const contentTypes: Record<string, string> = {
+    aac: "audio/aac",
+    aif: "audio/aiff",
+    aiff: "audio/aiff",
+    flac: "audio/flac",
+    m4a: "audio/mp4",
+    m4v: "video/x-m4v",
+    mov: "video/quicktime",
+    mp3: "audio/mpeg",
+    mp4: "video/mp4",
+    ogg: "audio/ogg",
+    opus: "audio/ogg",
+    wav: "audio/wav",
+    webm: "audio/webm",
+  };
+
+  return extension
+    ? (contentTypes[extension] ?? "application/octet-stream")
+    : "application/octet-stream";
+}
+
 function createOptimisticRecording({
   analysis,
   file,
@@ -1392,7 +1446,7 @@ function hasFileDrag(event: React.DragEvent<HTMLElement>) {
 }
 
 function isSupportedMediaFile(file: File) {
-  const type = file.type.toLowerCase();
+  const type = getMediaContentType(file);
   const name = file.name.toLowerCase();
 
   return (
