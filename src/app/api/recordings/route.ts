@@ -1,14 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { del, get } from "@vercel/blob";
 
-import {
-  createProcessingRecording,
-  markRecordingError,
-  markRecordingReady,
-} from "@/lib/db";
-import { transcribeWithElevenLabs } from "@/lib/elevenlabs";
-import { generateLessonNotes } from "@/lib/openai";
-import { fallbackPeaks } from "@/lib/recordings";
+import { processUploadedRecording } from "@/lib/process-recording";
 import { createClient } from "@/lib/supabase/server";
 
 export const maxDuration = 300;
@@ -57,61 +49,16 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid uploaded audio." }, { status: 400 });
   }
 
-  const blob = await get(blobPathname, {
-    access: "private",
-    useCache: false,
-  });
-
-  if (!blob || blob.statusCode !== 200) {
-    return NextResponse.json({ error: "Uploaded audio not found." }, { status: 404 });
-  }
-
-  const audioBlob = await new Response(blob.stream).blob();
-  const audioFile = new File([audioBlob], fileName, {
-    type: mimeType || blob.blob.contentType || "application/octet-stream",
-  });
-
   try {
-    await createProcessingRecording({
-      blobPathname: blob.blob.pathname,
-      blobUrl: blob.blob.url,
+    const recording = await processUploadedRecording({
+      blobPathname,
       durationSeconds,
       fileName,
       id: recordingId,
       mimeType,
       title,
       userId: user.id,
-      waveformPeaks: waveformPeaks.length ? waveformPeaks : fallbackPeaks(),
-    });
-  } catch (error) {
-    await del(blobPathname).catch(() => undefined);
-    return NextResponse.json(
-      {
-        error: error instanceof Error ? error.message : "Recording save failed.",
-      },
-      { status: 500 },
-    );
-  }
-
-  try {
-    const transcription = await transcribeWithElevenLabs(audioFile);
-    const generated = await generateLessonNotes({
-      durationSeconds: transcription.durationSeconds ?? durationSeconds,
-      title,
-      transcript: transcription.text,
-      words: transcription.words,
-    });
-
-    const recording = await markRecordingReady({
-      annotations: generated.annotations,
-      durationSeconds: transcription.durationSeconds ?? durationSeconds,
-      id: recordingId,
-      notes: generated.notes,
-      notesMarkdown: generated.markdown,
-      transcriptSegments: transcription.segments,
-      transcriptText: transcription.text,
-      transcriptWords: transcription.words,
-      userId: user.id,
+      waveformPeaks,
     });
 
     return NextResponse.json({
@@ -119,16 +66,7 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Processing failed.";
-    try {
-      const recording = await markRecordingError({
-        errorMessage: message,
-        id: recordingId,
-        userId: user.id,
-      });
-      return NextResponse.json({ error: message, recording }, { status: 500 });
-    } catch {
-      return NextResponse.json({ error: message }, { status: 500 });
-    }
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
 

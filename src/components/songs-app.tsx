@@ -119,6 +119,7 @@ export function SongsApp({
     const startedAt = Date.now();
     const fileName = file.name || "recording";
     const contentType = getMediaContentType(file);
+    const title = stripExtension(fileName);
 
     setUploadError(null);
     setUploading(true);
@@ -135,9 +136,30 @@ export function SongsApp({
       total: file.size,
     });
 
+    const analysis = await analyzeAudio(file);
+    const optimisticRecording = createOptimisticRecording({
+      analysis,
+      file,
+      mimeType: contentType,
+      recordingId,
+      title,
+      userId,
+    });
+    let bytesUploaded = false;
     let noProgressTimeoutId: number | null = null;
+    let resolveBytesUploaded: (() => void) | null = null;
+    const bytesUploadedPromise = new Promise<void>((resolve) => {
+      resolveBytesUploaded = resolve;
+    });
 
     try {
+      setRecordings((current) => [
+        optimisticRecording,
+        ...current.filter((recording) => recording.id !== optimisticRecording.id),
+      ]);
+      setActiveId(optimisticRecording.id);
+      setMobileDetailOpen(true);
+
       noProgressTimeoutId = window.setTimeout(() => {
         setUploadState((current) =>
           current && current.stage === "preparing"
@@ -149,11 +171,20 @@ export function SongsApp({
         );
       }, 15000);
 
-      const blob = await upload(
+      const uploadPromise = upload(
         `${userId}/${recordingId}/${safeFileName(fileName)}`,
         file,
         {
           access: "private",
+          clientPayload: JSON.stringify({
+            durationSeconds: analysis.durationSeconds,
+            fileName,
+            mimeType: contentType,
+            recordingId,
+            title,
+            userId,
+            waveformPeaks: analysis.peaks,
+          }),
           contentType,
           handleUploadUrl: "/api/recordings/blob",
           multipart: file.size >= MULTIPART_UPLOAD_THRESHOLD_BYTES,
@@ -163,6 +194,14 @@ export function SongsApp({
             if (progress.loaded > 0 && noProgressTimeoutId) {
               window.clearTimeout(noProgressTimeoutId);
               noProgressTimeoutId = null;
+            }
+
+            if (
+              !bytesUploaded &&
+              (progress.percentage >= 100 || progress.loaded >= progress.total)
+            ) {
+              bytesUploaded = true;
+              resolveBytesUploaded?.();
             }
 
             setUploadState((current) =>
@@ -178,6 +217,11 @@ export function SongsApp({
           },
         },
       );
+      const uploadFinishedPromise = uploadPromise.then(() => undefined);
+
+      void uploadFinishedPromise.catch(() => undefined);
+
+      await Promise.race([uploadFinishedPromise, bytesUploadedPromise]);
       setUploadState((current) =>
         current
           ? {
@@ -191,55 +235,24 @@ export function SongsApp({
           : current,
       );
 
-      const analysis = await analyzeAudio(file);
-      const optimisticRecording = createOptimisticRecording({
-        analysis,
-        file,
-        recordingId,
-        title: stripExtension(fileName),
-        userId,
+      const recording = await pollRecording(recordingId, (recordingUpdate) => {
+        setRecordings((current) =>
+          current.map((recording) =>
+            recording.id === recordingUpdate.id ? recordingUpdate : recording,
+          ),
+        );
       });
 
-      setRecordings((current) => [
-        optimisticRecording,
-        ...current.filter((recording) => recording.id !== optimisticRecording.id),
-      ]);
-      setActiveId(optimisticRecording.id);
+      setRecordings((current) =>
+        current.map((currentRecording) =>
+          currentRecording.id === recording.id ? recording : currentRecording,
+        ),
+      );
+      setActiveId(recording.id);
       setMobileDetailOpen(true);
 
-      const response = await fetch("/api/recordings", {
-        body: JSON.stringify({
-          blob_pathname: blob.pathname,
-          duration_seconds: analysis.durationSeconds,
-          file_name: fileName || null,
-          mime_type: contentType,
-          recording_id: recordingId,
-          title: stripExtension(fileName),
-          waveform_peaks: analysis.peaks,
-        }),
-        headers: { "Content-Type": "application/json" },
-        method: "POST",
-      });
-      const payload = await readJsonResponse<{
-        error?: string;
-        recording?: Recording;
-      }>(response);
-
-      if (payload.recording) {
-        setRecordings((current) => [
-          payload.recording!,
-          ...current.filter((recording) => recording.id !== payload.recording!.id),
-        ]);
-        setActiveId(payload.recording.id);
-        setMobileDetailOpen(true);
-      }
-
-      if (!response.ok) {
-        throw new Error(payload.error ?? "Upload failed.");
-      }
-
-      if (!payload.recording) {
-        throw new Error("Upload finished, but the recording was not returned.");
+      if (recording.status === "error") {
+        throw new Error(recording.error_message ?? "Processing failed.");
       }
 
       setUploadState((current) =>
@@ -1383,12 +1396,14 @@ function getMediaContentType(file: File) {
 function createOptimisticRecording({
   analysis,
   file,
+  mimeType,
   recordingId,
   title,
   userId,
 }: {
   analysis: { durationSeconds: number | null; peaks: number[] };
   file: File;
+  mimeType: string;
   recordingId: string;
   title: string;
   userId: string;
@@ -1402,7 +1417,7 @@ function createOptimisticRecording({
     error_message: null,
     file_name: file.name || null,
     id: recordingId,
-    mime_type: file.type || null,
+    mime_type: mimeType,
     notes_json: null,
     notes_markdown: null,
     status: "processing",
@@ -1439,6 +1454,48 @@ function getUploadProgress(
     speedBps,
     total,
   };
+}
+
+async function pollRecording(
+  recordingId: string,
+  onUpdate: (recording: Recording) => void,
+) {
+  const startedAt = Date.now();
+  const timeoutMs = 15 * 60 * 1000;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const response = await fetch(`/api/recordings/${recordingId}`, {
+      cache: "no-store",
+    });
+
+    if (response.status === 404) {
+      await delay(2500);
+      continue;
+    }
+
+    const payload = await readJsonResponse<{
+      error?: string;
+      recording?: Recording;
+    }>(response);
+
+    if (!response.ok || !payload.recording) {
+      throw new Error(payload.error ?? "Unable to load recording status.");
+    }
+
+    onUpdate(payload.recording);
+
+    if (payload.recording.status !== "processing") {
+      return payload.recording;
+    }
+
+    await delay(3500);
+  }
+
+  throw new Error("Processing is taking longer than expected. Refresh in a bit.");
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function hasFileDrag(event: React.DragEvent<HTMLElement>) {

@@ -80,6 +80,21 @@ export async function listRecordingsForUser(userId: string) {
   return normalizeRecordings(rows);
 }
 
+export async function getRecordingForUser(input: {
+  id: string;
+  userId: string;
+}) {
+  const rows = await queryRecordingRows(
+    `select ${RECORDING_COLUMNS}
+     from recordings
+     where id = $1 and user_id = $2
+     limit 1`,
+    [input.id, input.userId],
+  );
+
+  return rows[0] ? normalizeRecording(rows[0]) : null;
+}
+
 export async function createProcessingRecording(input: {
   blobPathname: string;
   blobUrl: string;
