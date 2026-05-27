@@ -1,5 +1,6 @@
 "use client";
 
+import { upload } from "@vercel/blob/client";
 import {
   AlertCircle,
   ArrowLeft,
@@ -36,9 +37,11 @@ type ChatMessage = {
 export function SongsApp({
   initialRecordings,
   userEmail,
+  userId,
 }: {
   initialRecordings: Recording[];
   userEmail: string;
+  userId: string;
 }) {
   const [recordings, setRecordings] = useState(initialRecordings);
   const [activeId, setActiveId] = useState(initialRecordings[0]?.id ?? null);
@@ -87,20 +90,35 @@ export function SongsApp({
 
     try {
       const analysis = await analyzeAudio(file);
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("title", stripExtension(file.name));
-      formData.append("duration_seconds", String(analysis.durationSeconds ?? ""));
-      formData.append("waveform_peaks", JSON.stringify(analysis.peaks));
+      const recordingId = crypto.randomUUID();
+      const blob = await upload(
+        `${userId}/${recordingId}/${safeFileName(file.name || "recording")}`,
+        file,
+        {
+          access: "private",
+          contentType: file.type || "application/octet-stream",
+          handleUploadUrl: "/api/recordings/blob",
+          multipart: true,
+        },
+      );
 
       const response = await fetch("/api/recordings", {
-        body: formData,
+        body: JSON.stringify({
+          blob_pathname: blob.pathname,
+          duration_seconds: analysis.durationSeconds,
+          file_name: file.name || null,
+          mime_type: file.type || null,
+          recording_id: recordingId,
+          title: stripExtension(file.name),
+          waveform_peaks: analysis.peaks,
+        }),
+        headers: { "Content-Type": "application/json" },
         method: "POST",
       });
-      const payload = (await response.json()) as {
+      const payload = await readJsonResponse<{
         error?: string;
         recording?: Recording;
-      };
+      }>(response);
 
       if (payload.recording) {
         setRecordings((current) => [
@@ -136,10 +154,10 @@ export function SongsApp({
         headers: { "Content-Type": "application/json" },
         method: "PATCH",
       });
-      const payload = (await response.json()) as {
+      const payload = await readJsonResponse<{
         error?: string;
         recording?: Recording;
-      };
+      }>(response);
 
       if (!response.ok || !payload.recording) {
         throw new Error(payload.error ?? "Unable to save notes.");
@@ -177,7 +195,9 @@ export function SongsApp({
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
-      const payload = (await response.json()) as { answer?: string; error?: string };
+      const payload = await readJsonResponse<{ answer?: string; error?: string }>(
+        response,
+      );
 
       if (!response.ok) {
         throw new Error(payload.error ?? "Unable to answer.");
@@ -1034,6 +1054,33 @@ async function analyzeAudio(file: File): Promise<{
 
 function stripExtension(fileName: string) {
   return fileName.replace(/\.[^/.]+$/, "") || "Untitled lesson";
+}
+
+function safeFileName(fileName: string) {
+  const cleaned = fileName
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return cleaned || "recording";
+}
+
+async function readJsonResponse<T extends { error?: string }>(
+  response: Response,
+): Promise<T> {
+  const text = await response.text();
+
+  if (!text) {
+    return {} as T;
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return {
+      error: text.slice(0, 300) || response.statusText || "Request failed.",
+    } as T;
+  }
 }
 
 function formatDate(value: string) {

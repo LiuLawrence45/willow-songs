@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { del, put } from "@vercel/blob";
+import { del, get } from "@vercel/blob";
 
 import {
   createProcessingRecording,
@@ -13,6 +13,16 @@ import { createClient } from "@/lib/supabase/server";
 
 export const maxDuration = 300;
 
+type CreateRecordingBody = {
+  blob_pathname?: unknown;
+  duration_seconds?: unknown;
+  file_name?: unknown;
+  mime_type?: unknown;
+  recording_id?: unknown;
+  title?: unknown;
+  waveform_peaks?: unknown;
+};
+
 export async function POST(request: NextRequest) {
   const supabase = await createClient();
   const {
@@ -24,50 +34,57 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const formData = await request.formData();
-  const file = formData.get("file");
-
-  if (!(file instanceof File)) {
-    return NextResponse.json({ error: "Missing audio file." }, { status: 400 });
-  }
-
-  const recordingId = crypto.randomUUID();
+  const body = (await request.json()) as CreateRecordingBody;
+  const recordingId = stringValue(body.recording_id);
+  const fileName = stringValue(body.file_name) || "recording";
+  const mimeType = stringValue(body.mime_type) || "application/octet-stream";
+  const blobPathname = stringValue(body.blob_pathname);
   const title =
-    stringFormValue(formData.get("title")) || stripExtension(file.name) || "Untitled lesson";
-  const durationSeconds = numberFormValue(formData.get("duration_seconds"));
-  const waveformPeaks = parsePeaks(formData.get("waveform_peaks"));
-  const blobPathname = `${user.id}/${recordingId}/${safeFileName(file.name || "recording")}`;
+    stringValue(body.title) || stripExtension(fileName) || "Untitled lesson";
+  const durationSeconds = numberValue(body.duration_seconds);
+  const waveformPeaks = parsePeaks(body.waveform_peaks);
 
-  let blob;
-  try {
-    blob = await put(blobPathname, file, {
-      access: "private",
-      addRandomSuffix: false,
-      contentType: file.type || "application/octet-stream",
-    });
-  } catch (error) {
+  if (!isUuid(recordingId)) {
     return NextResponse.json(
-      {
-        error: error instanceof Error ? error.message : "Audio upload failed.",
-      },
-      { status: 500 },
+      { error: "Missing recording id." },
+      { status: 400 },
     );
   }
 
+  const expectedPrefix = `${user.id}/${recordingId}/`;
+
+  if (!blobPathname || !blobPathname.startsWith(expectedPrefix)) {
+    return NextResponse.json({ error: "Invalid uploaded audio." }, { status: 400 });
+  }
+
+  const blob = await get(blobPathname, {
+    access: "private",
+    useCache: false,
+  });
+
+  if (!blob || blob.statusCode !== 200) {
+    return NextResponse.json({ error: "Uploaded audio not found." }, { status: 404 });
+  }
+
+  const audioBlob = await new Response(blob.stream).blob();
+  const audioFile = new File([audioBlob], fileName, {
+    type: mimeType || blob.blob.contentType || "application/octet-stream",
+  });
+
   try {
     await createProcessingRecording({
-      blobPathname: blob.pathname,
-      blobUrl: blob.url,
+      blobPathname: blob.blob.pathname,
+      blobUrl: blob.blob.url,
       durationSeconds,
-      fileName: file.name || null,
+      fileName,
       id: recordingId,
-      mimeType: file.type || null,
+      mimeType,
       title,
       userId: user.id,
       waveformPeaks: waveformPeaks.length ? waveformPeaks : fallbackPeaks(),
     });
   } catch (error) {
-    await del(blob.url).catch(() => undefined);
+    await del(blobPathname).catch(() => undefined);
     return NextResponse.json(
       {
         error: error instanceof Error ? error.message : "Recording save failed.",
@@ -77,7 +94,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const transcription = await transcribeWithElevenLabs(file);
+    const transcription = await transcribeWithElevenLabs(audioFile);
     const generated = await generateLessonNotes({
       durationSeconds: transcription.durationSeconds ?? durationSeconds,
       title,
@@ -115,46 +132,35 @@ export async function POST(request: NextRequest) {
   }
 }
 
-function stringFormValue(value: FormDataEntryValue | null) {
+function stringValue(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function numberFormValue(value: FormDataEntryValue | null) {
-  if (typeof value !== "string") {
+function numberValue(value: unknown) {
+  if (typeof value !== "number") {
     return null;
   }
 
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  return Number.isFinite(value) && value > 0 ? value : null;
 }
 
-function parsePeaks(value: FormDataEntryValue | null) {
-  if (typeof value !== "string") {
+function parsePeaks(value: unknown) {
+  if (!Array.isArray(value)) {
     return [];
   }
 
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed)
-      ? parsed
-          .map((peak) => Number(peak))
-          .filter((peak) => Number.isFinite(peak) && peak >= 0)
-          .slice(0, 240)
-      : [];
-  } catch {
-    return [];
-  }
+  return value
+    .map((peak) => Number(peak))
+    .filter((peak) => Number.isFinite(peak) && peak >= 0)
+    .slice(0, 240);
 }
 
 function stripExtension(fileName: string) {
   return fileName.replace(/\.[^/.]+$/, "");
 }
 
-function safeFileName(fileName: string) {
-  const cleaned = fileName
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-  return cleaned || "recording";
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value,
+  );
 }

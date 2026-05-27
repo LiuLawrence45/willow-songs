@@ -42,6 +42,7 @@ export default async function Home() {
     <SongsApp
       initialRecordings={recordings}
       userEmail={user.email ?? "account"}
+      userId={user.id}
     />
   );
 }
